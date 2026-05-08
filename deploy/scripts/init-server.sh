@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
 # Первичная настройка сервера Ubuntu 22.04+ для AI-Backend.
-# Запускать один раз от sudo-пользователя на свежей машине.
+# Запускать один раз на свежей машине от root или sudo-юзера.
 set -euo pipefail
 
-DEPLOY_DIR="/opt/aibased"
-DEPLOY_USER="${DEPLOY_USER:-$USER}"
+DEPLOY_DIR="${DEPLOY_DIR:-/opt/aibased}"
+DEPLOY_USER="${DEPLOY_USER:-${SUDO_USER:-$(id -un)}}"
 
 log() { printf '\n\033[1;36m[init-server]\033[0m %s\n' "$*"; }
 
+# Если запущено от root — sudo не нужен. Если от обычного юзера — используем sudo.
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
 require_sudo() {
-    if [ "$(id -u)" -eq 0 ]; then
-        log "Запущено от root. Рекомендуется создать обычного sudo-юзера и запускать от него."
+    if [ -n "$SUDO" ]; then
+        sudo -v
     fi
-    sudo -v
 }
 
 apt_update() {
     log "Обновляю apt и базовые утилиты"
-    sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
-    sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        ca-certificates curl gnupg ufw fail2ban unattended-upgrades htop git jq
+    $SUDO bash -c "DEBIAN_FRONTEND=noninteractive apt-get update -y"
+    $SUDO bash -c "DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+    $SUDO bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        ca-certificates curl gnupg ufw fail2ban unattended-upgrades htop git jq"
 }
 
 setup_swap() {
@@ -28,16 +34,16 @@ setup_swap() {
         log "Swap уже настроен"
         return
     fi
-    log "Создаю swap 2GB (диск всего 15GB — нужно для билдов и LLM-всплесков)"
-    sudo fallocate -l 2G /swapfile
-    sudo chmod 600 /swapfile
-    sudo mkswap /swapfile
-    sudo swapon /swapfile
+    log "Создаю swap 2GB (диск 15GB — нужно для билдов и LLM-всплесков)"
+    $SUDO fallocate -l 2G /swapfile
+    $SUDO chmod 600 /swapfile
+    $SUDO mkswap /swapfile
+    $SUDO swapon /swapfile
     if ! grep -q '/swapfile' /etc/fstab; then
-        echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+        echo '/swapfile none swap sw 0 0' | $SUDO tee -a /etc/fstab >/dev/null
     fi
-    sudo sysctl vm.swappiness=10 || true
-    echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swappiness.conf >/dev/null
+    $SUDO sysctl vm.swappiness=10 || true
+    echo 'vm.swappiness=10' | $SUDO tee /etc/sysctl.d/99-swappiness.conf >/dev/null
 }
 
 install_docker() {
@@ -46,26 +52,28 @@ install_docker() {
         return
     fi
     log "Ставлю Docker Engine и compose-плагин"
-    sudo install -m 0755 -d /etc/apt/keyrings
+    $SUDO install -m 0755 -d /etc/apt/keyrings
     if [ ! -f /etc/apt/keyrings/docker.asc ]; then
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
-            sudo tee /etc/apt/keyrings/docker.asc >/dev/null
-        sudo chmod a+r /etc/apt/keyrings/docker.asc
+            $SUDO tee /etc/apt/keyrings/docker.asc >/dev/null
+        $SUDO chmod a+r /etc/apt/keyrings/docker.asc
     fi
     . /etc/os-release
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
 https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" | \
-        sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-    sudo apt-get update -y
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+    $SUDO apt-get update -y
+    $SUDO bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
 
-    sudo usermod -aG docker "$DEPLOY_USER" || true
-    sudo systemctl enable --now docker
+    if [ "$DEPLOY_USER" != "root" ]; then
+        $SUDO usermod -aG docker "$DEPLOY_USER" || true
+    fi
+    $SUDO systemctl enable --now docker
 
     log "Настраиваю log-rotation для docker (10MB × 3)"
-    sudo mkdir -p /etc/docker
-    sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+    $SUDO mkdir -p /etc/docker
+    $SUDO tee /etc/docker/daemon.json >/dev/null <<'JSON'
 {
   "log-driver": "json-file",
   "log-opts": {
@@ -74,37 +82,38 @@ https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" | \
   }
 }
 JSON
-    sudo systemctl restart docker
+    $SUDO systemctl restart docker
 }
 
 setup_firewall() {
     log "Настраиваю UFW: 22/tcp, 80/tcp, 443/tcp"
-    sudo ufw default deny incoming
-    sudo ufw default allow outgoing
-    sudo ufw allow 22/tcp
-    sudo ufw allow 80/tcp
-    sudo ufw allow 443/tcp
-    sudo ufw --force enable
+    $SUDO ufw default deny incoming
+    $SUDO ufw default allow outgoing
+    $SUDO ufw allow 22/tcp
+    $SUDO ufw allow 80/tcp
+    $SUDO ufw allow 443/tcp
+    $SUDO ufw --force enable
 }
 
 setup_unattended_upgrades() {
     log "Включаю автоматические security-обновления"
-    sudo dpkg-reconfigure -f noninteractive unattended-upgrades || true
-    echo 'APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";' | \
-        sudo tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
+    $SUDO dpkg-reconfigure -f noninteractive unattended-upgrades || true
+    {
+        echo 'APT::Periodic::Update-Package-Lists "1";'
+        echo 'APT::Periodic::Unattended-Upgrade "1";'
+    } | $SUDO tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
 }
 
 prepare_deploy_dir() {
     log "Готовлю каталог $DEPLOY_DIR"
-    sudo mkdir -p "$DEPLOY_DIR"/{nginx/conf.d,nginx/conf.d.bootstrap,certbot/conf,certbot/www,scripts}
-    sudo chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$DEPLOY_DIR"
+    $SUDO mkdir -p "$DEPLOY_DIR"/{nginx/conf.d,nginx/conf.d.bootstrap,certbot/conf,certbot/www,scripts}
+    $SUDO chown -R "$DEPLOY_USER":"$DEPLOY_USER" "$DEPLOY_DIR"
 }
 
 setup_disk_cleanup_cron() {
     log "Добавляю еженедельную очистку старых docker-образов"
     CRON_LINE="0 4 * * 0 /usr/bin/docker image prune -af --filter \"until=72h\" >/var/log/docker-prune.log 2>&1"
-    ( sudo crontab -l 2>/dev/null | grep -v 'docker image prune' ; echo "$CRON_LINE" ) | sudo crontab -
+    ( $SUDO crontab -l 2>/dev/null | grep -v 'docker image prune' ; echo "$CRON_LINE" ) | $SUDO crontab -
 }
 
 main() {
@@ -117,8 +126,11 @@ main() {
     prepare_deploy_dir
     setup_disk_cleanup_cron
 
-    log "Готово. Перелогиньтесь (или выполните 'newgrp docker'), чтобы получить группу docker без sudo."
-    log "Дальше: загрузите содержимое каталога deploy/ в $DEPLOY_DIR и запустите init-letsencrypt.sh"
+    log "Готово."
+    if [ "$DEPLOY_USER" != "root" ]; then
+        log "Перелогиньтесь (или выполните 'newgrp docker'), чтобы получить группу docker без sudo."
+    fi
+    log "Дальше: скопируйте содержимое каталога deploy/ в $DEPLOY_DIR и запустите init-letsencrypt.sh"
 }
 
 main "$@"
