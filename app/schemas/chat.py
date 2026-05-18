@@ -68,7 +68,8 @@ class SendMessageRequest(CamelModel):
         extra="forbid",
         json_schema_extra={
             "examples": [
-                {"message": "Привет! Подскажи рифмы к слову love."},
+                {"message": "Привет! Подскажи рифмы к слову love.",
+                 "conversationId": "f2bf8c34-4125-4c98-a838-40c22fabb148"},
                 {
                     "message": "And now suggest two more lines.",
                     "conversationId": "f2bf8c34-4125-4c98-a838-40c22fabb148",
