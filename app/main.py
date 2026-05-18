@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,9 +14,15 @@ from app.db.session import build_engine, build_sessionmaker
 from app.logging_config import setup_logging
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.request_context import RequestContextMiddleware
+from app.music.providers.fal.client import FalAiProvider
+from app.music.providers.fal.stub import StubFalProvider
+from app.music.services.recovery import recover_orphan_jobs
+from app.music.services.wallet_service import WalletService
 from app.providers.llm.openai_provider import OpenAIProvider
 from app.providers.word_tools.llm_prompt_provider import LLMPromptWordToolsProvider
 from app.providers.word_tools.prompt_loader import PromptLoader
+
+logger = logging.getLogger(__name__)
 
 
 def _default_llm_factory(settings: Settings):
@@ -25,11 +32,37 @@ def _default_llm_factory(settings: Settings):
     )
 
 
+def _default_fal_factory(settings: Settings):
+    if settings.FAL_USE_STUB:
+        logger.warning(
+            "FAL_USE_STUB=true — using in-process StubFalProvider (dev only)"
+        )
+        return StubFalProvider(
+            webhook_secret=settings.FAL_WEBHOOK_SECRET.get_secret_value()
+        )
+    key = settings.FAL_API_KEY.get_secret_value()
+    if not key:
+        logger.warning(
+            "FAL_API_KEY is not configured; music-generation endpoints will 503"
+        )
+        return None
+    return FalAiProvider(
+        api_key=key,
+        base_url=settings.FAL_BASE_URL,
+        music_model=settings.FAL_MUSIC_MODEL,
+        refine_model=settings.FAL_REFINE_MODEL,
+        speech_model=settings.FAL_SPEECH_MODEL,
+        webhook_secret=settings.FAL_WEBHOOK_SECRET.get_secret_value(),
+        timeout_seconds=settings.FAL_HTTP_TIMEOUT_SECONDS,
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     *,
     llm_factory=None,
     word_tools_provider_factory=None,
+    fal_factory=None,
     sessionmaker=None,
     engine=None,
 ) -> FastAPI:
@@ -64,23 +97,45 @@ def create_app(
             )
         app.state.word_tools_provider = provider
 
+        # Music: fal provider + recovery sweep
+        fal = (fal_factory or _default_fal_factory)(settings)
+        app.state.fal_provider = fal
+
+        try:
+            recovered = await recover_orphan_jobs(
+                sessionmaker=app.state.sessionmaker,
+                wallet=WalletService(app.state.sessionmaker),
+            )
+            if recovered:
+                logger.info("Recovered %d orphan jobs on startup", recovered)
+        except Exception:
+            logger.exception("Recovery sweep failed on startup")
+
         try:
             yield
         finally:
+            fal_instance = getattr(app.state, "fal_provider", None)
+            if fal_instance is not None and hasattr(fal_instance, "aclose"):
+                try:
+                    await fal_instance.aclose()
+                except Exception:
+                    logger.exception("Failed to close fal provider")
             local_engine = getattr(app.state, "engine", None)
             if local_engine is not None and engine is None:
                 await local_engine.dispose()
 
     app = FastAPI(
-        title="AI Backend — AI Chat и Word Tools",
+        title="AI Backend — AI Chat, Word Tools, Music Generation",
         description=(
-            "Backend для AI-чата с поддержкой `conversationId` "
-            "и поиска слов/фраз по 16 языковым критериям через LLM.\n\n"
-            "**Авторизация:** на каждом запросе (кроме `/healthz`) "
-            "передавайте заголовок `Authorization: Bearer <API_KEY>`.\n\n"
+            "Backend для AI-чата, поиска слов и генерации музыки через "
+            "fal.ai с монетизацией на токенах.\n\n"
+            "**Авторизация:** на каждом запросе (кроме `/healthz` и "
+            "webhook-эндпоинтов) передавайте `Authorization: Bearer <API_KEY>`. "
+            "Для music-эндпоинтов дополнительно нужен заголовок "
+            "`X-User-Id` (Adapty profile id или аналогичный устойчивый "
+            "идентификатор устройства).\n\n"
             "В Swagger UI нажмите кнопку **Authorize** в правом верхнем углу "
-            "и введите ваш `API_KEY` — Swagger будет автоматически "
-            "подставлять токен ко всем запросам."
+            "и введите ваш `API_KEY`."
         ),
         version="1.0.0",
         default_response_class=ORJSONResponse,
@@ -102,6 +157,39 @@ def create_app(
                 ),
             },
             {
+                "name": "music-catalog",
+                "description": (
+                    "Каталог битов и sound-элементов. Требует `X-User-Id`."
+                ),
+            },
+            {
+                "name": "music-tracks",
+                "description": (
+                    "Генерация треков через fal.ai (gate → reserve → submit → "
+                    "webhook → capture). Требует `X-User-Id` и активной "
+                    "подписки."
+                ),
+            },
+            {
+                "name": "music-tokens",
+                "description": (
+                    "Баланс токенов и каталог токен-паков."
+                ),
+            },
+            {
+                "name": "music-uploads",
+                "description": (
+                    "Загрузка пользовательских ресурсов (voice) в fal storage."
+                ),
+            },
+            {
+                "name": "music-webhooks",
+                "description": (
+                    "Webhook-эндпоинты для fal.ai, Adapty и RuStore. "
+                    "Авторизуются подписью провайдера, не через Bearer."
+                ),
+            },
+            {
                 "name": "system",
                 "description": "Служебные эндпоинты (healthcheck).",
             },
@@ -109,8 +197,6 @@ def create_app(
     )
 
     app.state.settings = settings
-    # Resolver is also re-created in lifespan; pre-create so middleware that
-    # runs before lifespan completes (e.g. during tests) can rely on it.
     app.state.api_key_resolver = ApiKeyResolver(settings.api_key_map)
 
     register_exception_handlers(app)

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.config import get_settings
 from app.models import Base
+from app.music import models as _music_models  # noqa: F401  -- register music models
 
 config = context.config
 

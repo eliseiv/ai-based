@@ -84,6 +84,81 @@ class AuthError(APIError):
     message = "Invalid or missing API key"
 
 
+# --- Music module errors ---
+
+
+class MissingXUserId(APIError):
+    code = "missing_x_user_id"
+    http_status = 400
+    message = "Missing or invalid X-User-Id header"
+
+
+class SubscriptionInactive(APIError):
+    code = "subscription_inactive"
+    http_status = 402
+    message = "Active subscription required"
+
+
+class InsufficientTokens(APIError):
+    code = "insufficient_tokens"
+    http_status = 402
+    message = "Not enough tokens to perform the operation"
+
+
+class JobNotFound(APIError):
+    code = "job_not_found"
+    http_status = 404
+    message = "Generation job not found"
+
+
+class JobForbidden(APIError):
+    code = "job_forbidden"
+    http_status = 403
+    message = "Generation job belongs to another user"
+
+
+class TrackNotFound(APIError):
+    code = "track_not_found"
+    http_status = 404
+    message = "Track not found"
+
+
+class BeatNotFound(APIError):
+    code = "beat_not_found"
+    http_status = 404
+    message = "Beat not found"
+
+
+class WebhookSignatureInvalid(APIError):
+    code = "webhook_signature_invalid"
+    http_status = 401
+    message = "Webhook signature verification failed"
+
+
+class WebhookPayloadInvalid(APIError):
+    code = "webhook_payload_invalid"
+    http_status = 400
+    message = "Webhook payload is malformed"
+
+
+class PricingRuleMissing(APIError):
+    code = "pricing_rule_missing"
+    http_status = 500
+    message = "No active pricing rule configured for the provider model"
+
+
+class FalProviderError(APIError):
+    code = "fal_provider_error"
+    http_status = 502
+    message = "fal.ai provider returned an error"
+
+
+class FalTimeout(APIError):
+    code = "fal_timeout"
+    http_status = 504
+    message = "fal.ai provider timed out"
+
+
 def _envelope(
     *,
     code: str,

@@ -1,11 +1,12 @@
-# AI Backend — AI Chat + Word Tools
+# AI Backend — AI Chat + Word Tools + Music Generation
 
 Backend-сервис, реализующий:
 
 1. **AI-чат** с поддержкой `conversationId` (автосоздание при первом сообщении, ответы с учётом истории).
 2. **Word Tools** — поиск слов и фраз по 16 языковым критериям (рифмы, синонимы, антонимы, определения и т. д.) через LLM-провайдер.
+3. **Music Generation** — генерация музыки через fal.ai с монетизацией на токенах, подписками (Adapty/RuStore), кошельком и webhooks. Каталог битов и sound-элементов, voice-upload в fal storage.
 
-**Стек:** Python 3.12, FastAPI, SQLAlchemy 2 (async), PostgreSQL, Alembic, OpenAI SDK, Docker Compose.
+**Стек:** Python 3.12, FastAPI, SQLAlchemy 2 (async), PostgreSQL, Alembic, OpenAI SDK, fal.ai SDK через httpx, Docker Compose.
 
 ---
 
@@ -377,7 +378,90 @@ DATABASE_URL=postgresql+asyncpg://aibased:aibased@localhost:5432/aibased_test \
   pytest --cov=app --cov-report=term-missing
 ```
 
-LLM в тестах подменяется на `tests/fakes/fake_llm.py` — реальные вызовы OpenAI не выполняются.
+LLM в тестах подменяется на `tests/fakes/fake_llm.py` — реальные вызовы OpenAI не выполняются. `tests/fakes/fake_fal.py` подменяет fal.ai для тестов генерации.
+
+---
+
+## Music Generation (модуль `app/music/`)
+
+### Эндпоинты под `/api/v1/music/`
+
+| Метод и путь | Назначение |
+|---|---|
+| `GET /beats` | Каталог битов (5 жанров) |
+| `GET /samples` | Sound elements в 10 категориях с тегами |
+| `POST /tracks/generate` | Старт генерации: gate → reserve токенов → submit в fal → `jobId` |
+| `GET /tracks/jobs/{jobId}` | Статус задания + текущий stage |
+| `GET /tracks/{trackId}` | Готовый трек (audio_url, stems) |
+| `GET /tokens/balance` | Баланс + reserved + frozen |
+| `GET /tokens/products` | Токен-паки Adapty/RuStore |
+| `POST /uploads/voice` | Multipart-загрузка голоса → URL fal storage |
+| `POST /webhooks/fal` | Финализация job (capture/release токенов, INSERT tracks) |
+| `POST /webhooks/billing/adapty` | События Adapty (5 типов) |
+| `POST /webhooks/billing/rf` | События RuStore (5 типов) |
+
+### Авторизация для music-эндпоинтов
+
+Помимо `Authorization: Bearer <API_KEY>` нужен заголовок **`X-User-Id`** — стабильный идентификатор устройства/пользователя (например, Adapty profile id). Backend по нему ведёт записи в таблице `music_users` (атомарный upsert через `INSERT ... ON CONFLICT`).
+
+Webhook-эндпоинты `Authorization` не требуют — их авторизует подпись провайдера (HMAC-SHA256 от raw body).
+
+### Логика генерации
+
+1. `subscription_gate.ensure_active` — без активной подписки → 402 `subscription_inactive` (включая lazy-expire при истёкшем `expires_at`).
+2. `pricing_service` — резолв активного `pricing_rule`, расчёт `required_tokens_for_precharge` (per_track / per_minute × желаемая длительность).
+3. `wallet.reserve` — `SELECT FOR UPDATE` + idempotent INSERT в `token_ledger`. 402 `insufficient_tokens` при нехватке.
+4. `fal.submit_music_generation` с webhook callback. При ошибке fal — release токенов и `job.failed`.
+5. Webhook от fal:
+   - `completed` → `wallet.capture(actual_duration)` + INSERT `tracks` + `job.succeeded`
+   - `failed/canceled` → `wallet.release(reserved)` + `job.failed`
+   - Идемпотентен по `processed_webhooks(provider, event_id)`.
+
+### Биллинг-webhooks
+
+5 типов событий нормализуются в `NormalizedBillingEvent`:
+- `SUBSCRIPTION_PURCHASED` / `RENEWED` → `subscription_state.status='active'`, размораживаем кошелёк, опционально кредитуем токены
+- `SUBSCRIPTION_CANCELED` → `status='canceled'` (доступ до `expires_at`)
+- `SUBSCRIPTION_EXPIRED` → `status='expired'`, `wallet.frozen=true`
+- `ONE_TIME_PURCHASE` → резолв `token_products.token_amount` → `wallet.credit`
+- `REFUND` → `wallet.credit(amount=-X)` с clamp в 0
+
+Защита от reorder: `subscription_state.last_event_occurred_at` + `max(current, event)`.
+
+### Конфигурация (ENV)
+
+| Переменная | Назначение |
+|---|---|
+| `PUBLIC_BASE_URL` | Базовый URL backend для webhook callback в fal (`https://appstorepro.store`) |
+| `FAL_API_KEY` | Ключ fal.ai (без него `/tracks/generate` отдаёт 503) |
+| `FAL_BASE_URL` | По умолчанию `https://queue.fal.run` |
+| `FAL_WEBHOOK_SECRET` | HMAC-секрет для входящего webhook'а от fal |
+| `FAL_MUSIC_MODEL` / `FAL_REFINE_MODEL` / `FAL_SPEECH_MODEL` | Имена моделей |
+| `ADAPTY_WEBHOOK_SECRET` | Bearer-секрет Adapty (передаётся в заголовке `Authorization`) |
+| `RF_BILLING_WEBHOOK_SECRET` | HMAC-секрет RuStore |
+| `MUSIC_VOICE_MAX_BYTES` | Лимит размера voice-файла (по умолчанию 25 MiB) |
+| `MUSIC_VOICE_ALLOWED_CONTENT_TYPES` | CSV mime-allowlist |
+
+### Seed-данные
+
+Шаблонные beats/samples лежат в `app/music/seed/data/`. Залить в БД:
+
+```bash
+docker compose exec api python -m app.music.seed.run_seed \
+  --beats app/music/seed/data/beats.json \
+  --samples app/music/seed/data/samples.json
+```
+
+`pricing_rules` и `token_products` применяются автоматически через миграцию `0003_music_seed_pricing.py`.
+
+### Smoke-тест через Swagger
+
+1. В Swagger авторизуйтесь (`Authorize` → ваш API_KEY).
+2. Для каждого music-запроса откройте раздел **Parameters** и добавьте header `X-User-Id: test-device-1` (Swagger покажет поле автоматически, так как dep `get_music_user` зарегистрирован).
+3. `GET /api/v1/music/beats` — 5 битов.
+4. `GET /api/v1/music/samples` — 10 категорий.
+5. `GET /api/v1/music/tokens/balance` — `{available:0, reserved:0, frozen:false}` для нового X-User-Id.
+6. `POST /api/v1/music/tracks/generate` — без подписки → 402; без `FAL_API_KEY` → 503.
 
 ---
 
