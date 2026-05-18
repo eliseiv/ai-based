@@ -43,9 +43,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             "/docs",
             "/redoc",
             "/openapi.json",
-            "/api/v1/music/webhooks/fal",
-            "/api/v1/music/webhooks/billing/adapty",
-            "/api/v1/music/webhooks/billing/rf",
         }
     )
 

@@ -52,30 +52,6 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_MINUTE: int = 0
     RATE_LIMIT_BURST: int = 60
 
-    # --- Music module ---
-    PUBLIC_BASE_URL: str = ""
-
-    FAL_API_KEY: SecretStr = SecretStr("")
-    FAL_BASE_URL: str = "https://queue.fal.run"
-    FAL_HTTP_TIMEOUT_SECONDS: float = 30.0
-    FAL_WEBHOOK_SECRET: SecretStr = SecretStr("")
-    FAL_USE_STUB: bool = False  # dev-only: подменить fal на in-process stub
-    FAL_MUSIC_MODEL: str = "fal-ai/minimax-music"
-    FAL_REFINE_MODEL: str = "fal-ai/ace-step/audio-to-audio"
-    FAL_SPEECH_MODEL: str = "fal-ai/minimax/speech-02-turbo"
-
-    ADAPTY_WEBHOOK_SECRET: SecretStr = SecretStr("")
-    RF_BILLING_WEBHOOK_SECRET: SecretStr = SecretStr("")
-
-    MUSIC_MAX_CONCURRENT_GENERATIONS: int = 8
-    MUSIC_VOICE_MAX_BYTES: int = 26_214_400  # 25 MiB
-    MUSIC_VOICE_ALLOWED_CONTENT_TYPES: str = (
-        "audio/mpeg,audio/wav,audio/mp4,audio/x-m4a"
-    )
-    MUSIC_VOICE_MAX_CONCURRENT_UPLOADS: int = 4
-    MUSIC_DEFAULT_TRACK_DURATION_SECONDS: int = 60
-    MUSIC_JOB_HARD_TIMEOUT_SECONDS: int = 1800
-
     @field_validator("OPENAI_BASE_URL", "API_KEY", mode="before")
     @classmethod
     def _empty_str_to_none(cls, v: object) -> object:
