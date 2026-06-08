@@ -1,0 +1,60 @@
+# Production compose for the shared server behind the common Traefik edge.
+# - НЕ публикует порты (80/443 заняты Traefik; внутренний порт только expose).
+# - Подключается к внешней сети `web` (общая с Traefik) + внутренней `default`.
+# - Маршрут объявляется через docker-labels; TLS/Let's Encrypt делает Traefik.
+#
+# Деплой:  docker compose -f docker-compose.prod.yml up -d --build
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Пароль берётся из .env (POSTGRES_PASSWORD); переопределяет любое значение
+      # DATABASE_URL из .env, чтобы api ходил в наш внутренний postgres.
+      DATABASE_URL: postgresql+asyncpg://aibased:${POSTGRES_PASSWORD}@postgres:5432/aibased
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - web
+      - default
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.aibased.rule=Host(`appstorepro.store`)"
+      - "traefik.http.routers.aibased.entrypoints=websecure"
+      - "traefik.http.routers.aibased.tls.certresolver=le"
+      - "traefik.http.services.aibased.loadbalancer.server.port=8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aibased
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: aibased
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aibased -d aibased"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  web:
+    external: true
+  default:
+
+volumes:
+  pgdata:
