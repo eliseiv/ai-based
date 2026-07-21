@@ -383,18 +383,68 @@ LLM в тестах подменяется на `tests/fakes/fake_llm.py` — р
 
 ## Production-деплой
 
-Все артефакты для развёртывания на сервере (Nginx + certbot + автодеплой через GitHub Actions) лежат в каталоге [`deploy/`](deploy/README.md). Кратко:
+Production работает как multi-instance деплой одного backend-образа за общим Traefik:
 
-- **Nginx** обрывает TLS, редиректит HTTP→HTTPS, проксирует `/api/`, `/healthz`, `/docs`, `/redoc`, `/openapi.json` в контейнер `api`.
-- **Certbot** в отдельном контейнере выпускает и автоматически продлевает Let's Encrypt сертификаты для `appstorepro.store` через webroot-challenge. Nginx делает `nginx -s reload` каждые 6 часов.
-- **GitHub Actions** (`.github/workflows/deploy.yml`) при `git push origin main` билдит образ на ubuntu-раннере, пушит в `ghcr.io/<owner>/<repo>:sha-XXXXXXX`, заходит на сервер по SSH и делает `docker pull` + `docker compose up -d`. Старые образы автоматически очищаются (`docker image prune --filter until=72h`) — критично для серверов с маленьким диском.
-- **Скрипты в `deploy/scripts/`**:
-  - `init-server.sh` — настройка голой Ubuntu (Docker, ufw, fail2ban, swap 2GB, log-rotation, weekly cron-prune)
-  - `init-letsencrypt.sh` — первичный выпуск сертификатов
-  - `deploy.sh` — что выполняется на сервере при каждом деплое
-  - `renew-certs.sh` — ручное продление (на случай если)
+- **GitHub Actions** ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) при `git push origin main` билдит image и пушит его в `ghcr.io/<owner>/<repo>:sha-XXXXXXX` и `:latest`.
+- **Deploy job** в том же workflow запускается сразу после успешной сборки image. Ручного approval перед деплоем сейчас нет.
+- **SOPS env-файлы** лежат в `deploy/instances/*.env.enc`. Каждый файл описывает один instance.
+- **Сервер** получает deploy bundle, кладёт файлы в `/opt/ai-based-instances/<INSTANCE_SLUG>/`, пишет `.env` и `.env.image`, затем запускает `docker compose -p <INSTANCE_SLUG> ...`.
+- **Traefik** должен быть уже запущен и подключён к external Docker network `web`; роуты берутся из labels контейнера `api`.
 
-Подробная инструкция, чек-лист и список GitHub Secrets — в [`deploy/README.md`](deploy/README.md).
+Нужные GitHub Secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`, `GHCR_USER`, `GHCR_PULL_TOKEN`, `SOPS_AGE_KEY`.
+
+`GHCR_USER` — это GitHub username, под которым сервер логинится в GitHub Container Registry. Если `GHCR_PULL_TOKEN` выпущен на ваш аккаунт, укажите ваш GitHub login. Это обычный repository secret в **Settings → Secrets and variables → Actions**, отдельного пользователя в репозитории создавать не нужно.
+
+SOPS шифрует instance env-файлы на age recipient из [`.sops.yaml`](.sops.yaml):
+
+```text
+age1k272remz9ls43amrtpyqxf25jhe4m20qe9skq6rhd88st7l9lfrscamnka
+```
+
+Приватный age key для GitHub Actions хранится только в секрете `SOPS_AGE_KEY`. Не добавляйте его в репозиторий.
+
+### Добавить новый instance
+
+1. Создайте plaintext env локально из корневого шаблона:
+
+```bash
+cp .env.example deploy/instances/client-one.env
+```
+
+Заполните значения:
+
+```dotenv
+INSTANCE_SLUG=client-one
+SERVICE_DOMAIN=client-one.example.com
+
+POSTGRES_USER=client_one
+POSTGRES_DB=client_one
+POSTGRES_PASSWORD=<unique-strong-password>
+
+API_KEY=<unique-api-bearer-token>
+OPENAI_API_KEY=<openai-api-key>
+```
+
+Обязательные переменные: `INSTANCE_SLUG`, `SERVICE_DOMAIN`, `POSTGRES_USER`, `POSTGRES_DB`, `POSTGRES_PASSWORD`, `API_KEY`, `OPENAI_API_KEY`.
+
+Задавайте свой `POSTGRES_USER`, `POSTGRES_DB` и уникальный `POSTGRES_PASSWORD` для каждого инстанса. Удобная схема: `POSTGRES_USER` и `POSTGRES_DB` делать из `INSTANCE_SLUG`, заменив `-` на `_`. Эти значения должны оставаться стабильными между деплоями.
+
+Для первого существующего инстанса не меняйте старые `POSTGRES_*` значения. `INSTANCE_SLUG` должен совпадать со старым compose project name, иначе Docker создаст новый volume вместо использования старого.
+
+2. Зашифруйте файл и удалите plaintext:
+
+Для этой команды локально должен быть установлен `sops`; recipient берётся из `.sops.yaml`.
+
+```bash
+sops --input-type dotenv --output-type dotenv \
+  -e deploy/instances/client-one.env > deploy/instances/client-one.env.enc
+```
+
+`deploy/instances/*.env` игнорируются Git, коммитить нужно только `*.env.enc`.
+
+3. Запушьте изменения в `main`. Workflow соберёт image и сразу запустит deploy job.
+
+4. Pipeline расшифрует все `deploy/instances/*.env.enc`, обновит `.env` на сервере и пересоздаст `api` для каждого instance.
 
 ---
 
@@ -419,7 +469,7 @@ app/
   main.py        # фабрика приложения
 prompts/         # 16 шаблонов LLM + _shared/system.txt
 migrations/      # Alembic
-deploy/          # Nginx + certbot + production docker-compose + скрипты
-.github/workflows/deploy.yml   # CI/CD на ghcr.io + ssh deploy
+deploy/          # production compose/templates, scripts, encrypted instance envs
+.github/workflows/deploy.yml   # build image + multi-instance deploy
 tests/           # unit + integration + fakes
 ```
