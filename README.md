@@ -391,9 +391,9 @@ Production работает как multi-instance деплой одного back
 - **Сервер** получает deploy bundle, кладёт файлы в `/opt/ai-based-instances/<INSTANCE_SLUG>/`, пишет `.env` и `.env.image`, затем запускает `docker compose -p <INSTANCE_SLUG> ...`.
 - **Traefik** должен быть уже запущен и подключён к external Docker network `web`; роуты берутся из labels контейнера `api`.
 
-Нужные GitHub Secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`, `GHCR_USER`, `GHCR_PULL_TOKEN`, `SOPS_AGE_KEY`.
+Нужные GitHub Secrets: `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`, `SOPS_AGE_KEY`.
 
-`GHCR_USER` — это GitHub username, под которым сервер логинится в GitHub Container Registry. Если `GHCR_PULL_TOKEN` выпущен на ваш аккаунт, укажите ваш GitHub login. Это обычный repository secret в **Settings → Secrets and variables → Actions**, отдельного пользователя в репозитории создавать не нужно.
+Для GHCR отдельные secrets не нужны: workflow логинит сервер в GitHub Container Registry через встроенный `GITHUB_TOKEN`, которым этот же workflow собирает и пушит image.
 
 SOPS шифрует instance env-файлы на age recipient из [`.sops.yaml`](.sops.yaml):
 
