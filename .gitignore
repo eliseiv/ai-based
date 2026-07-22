@@ -5,6 +5,9 @@ __pycache__/
 venv/
 .env
 .env.local
+*.env
+!*.env.enc
+!.gitignore
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -15,6 +18,12 @@ build/
 .idea/
 .vscode/
 *.log
+
+# Local SOPS/age private keys
+age.key
+*.age.key
+sops-age.key
+*.sops-age.key
 
 # Production deploy artifacts (генерируются на сервере)
 deploy/.env

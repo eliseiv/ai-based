@@ -1,45 +1,346 @@
-name: Deploy
-
-# Деплой на общий сервер за Traefik: по push в main подключаемся по SSH и
-# обновляем сервис в /opt/ai-based. Traefik не трогаем — маршрут берётся из
-# docker-labels контейнера (docker-compose.prod.yml).
+name: Build and deploy
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      image_ref:
+        description: "Existing image ref to deploy; empty = build current commit"
+        required: false
+        default: ""
+        type: string
+      public_smoke_fatal:
+        description: "Fail deploy if public https://<domain>/healthz smoke does not pass"
+        required: true
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 concurrency:
   group: deploy-ai-based
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Все инстансы живут здесь, отдельно от старого /opt/ai-based.
+  DEPLOY_ROOT: /opt/ai-based-instances
+  SOPS_VERSION: 3.9.4
+
 jobs:
-  deploy:
+  resolve-image:
+    name: resolve image
     runs-on: ubuntu-latest
+    outputs:
+      image_ref: ${{ steps.image.outputs.image_ref }}
+      image_latest: ${{ steps.image.outputs.image_latest }}
+      should_build: ${{ steps.image.outputs.should_build }}
     steps:
-      - name: Setup SSH
+      - name: Resolve image ref
+        id: image
+        shell: bash
+        env:
+          IMAGE_REF_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.image_ref || '' }}
         run: |
+          set -euo pipefail
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image_latest=$image_name:latest" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$IMAGE_REF_INPUT" ]; then
+            echo "image_ref=$IMAGE_REF_INPUT" >> "$GITHUB_OUTPUT"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          image_tag="sha-${GITHUB_SHA::12}"
+          echo "image_ref=$image_name:$image_tag" >> "$GITHUB_OUTPUT"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+  build-image:
+    name: build and push backend image
+    runs-on: ubuntu-latest
+    needs: [resolve-image]
+    if: needs.resolve-image.outputs.should_build == 'true'
+    outputs:
+      image_ref: ${{ needs.resolve-image.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ needs.resolve-image.outputs.image_ref }}
+            ${{ needs.resolve-image.outputs.image_latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### Image pushed"
+            echo ""
+            echo "- \`${{ needs.resolve-image.outputs.image_ref }}\`"
+            echo "- \`${{ needs.resolve-image.outputs.image_latest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: provision and deploy instances
+    runs-on: ubuntu-latest
+    needs: [resolve-image, build-image]
+    if: always() && needs.resolve-image.result == 'success' && (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sops
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/sops.deb \
+            "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops_${SOPS_VERSION}_amd64.deb"
+          sudo dpkg -i /tmp/sops.deb
+          sops --version
+
+      - name: Build deploy bundle
+        shell: bash
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          IMAGE_REF: ${{ needs.resolve-image.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+
+          # Берём список инстансов из файлов deploy/instances/*.env.enc.
+          # Добавление нового encrypted env-файла = добавление нового backend instance.
+          shopt -s nullglob
+          instance_files=(deploy/instances/*.env.enc)
+          if [ "${#instance_files[@]}" -eq 0 ]; then
+            echo "::error title=No instances found::Expected encrypted files at deploy/instances/*.env.enc"
+            exit 1
+          fi
+
+          rm -rf .deploy-bundle
+          mkdir -p .deploy-bundle/instances
+
+          # Compose-файл один на все инстансы; различия приходят из .env.
+          install -m 0644 docker-compose.prod.yml .deploy-bundle/docker-compose.prod.yml
+
+          require_key() {
+            local file="$1"
+            local key="$2"
+            # Fail fast: лучше остановить CI до SSH, чем отправить на сервер
+            # неполный .env и получить полурабочий инстанс.
+            if ! grep -Eq "^${key}=" "$file"; then
+              echo "::error title=Invalid instance env::${file} has no ${key}"
+              exit 1
+            fi
+          }
+
+          : > .deploy-bundle/instances.list
+          for enc in "${instance_files[@]}"; do
+            base="$(basename "$enc" .env.enc)"
+            out=".deploy-bundle/instances/${base}.env"
+            # Расшифровываем env только внутри runner workspace.
+            sops --input-type dotenv --output-type dotenv -d "$enc" > "$out"
+
+            require_key "$out" INSTANCE_SLUG
+            require_key "$out" SERVICE_DOMAIN
+            require_key "$out" POSTGRES_USER
+            require_key "$out" POSTGRES_DB
+            require_key "$out" POSTGRES_PASSWORD
+            require_key "$out" API_KEY
+            require_key "$out" OPENAI_API_KEY
+
+            slug="$(grep -E '^INSTANCE_SLUG=' "$out" | head -n1 | cut -d= -f2- | tr -d '"[:space:]')"
+            domain="$(grep -E '^SERVICE_DOMAIN=' "$out" | head -n1 | cut -d= -f2- | tr -d '"[:space:]')"
+
+            # INSTANCE_SLUG используется как compose project name и часть Traefik labels,
+            # поэтому держим его коротким и предсказуемым.
+            if ! [[ "$slug" =~ ^[a-z0-9][a-z0-9-]{2,62}$ ]]; then
+              echo "::error title=Invalid INSTANCE_SLUG::${slug} must be lowercase letters, digits and hyphens"
+              exit 1
+            fi
+            # SERVICE_DOMAIN пойдёт в Traefik Host(...) rule и public smoke URL.
+            if ! [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+              echo "::error title=Invalid SERVICE_DOMAIN::${domain} has unsupported characters"
+              exit 1
+            fi
+
+            printf '%s|%s|%s.env\n' "$slug" "$domain" "$base" >> .deploy-bundle/instances.list
+          done
+
+          # .env.image отделён от instance env: CI может менять API_IMAGE на каждый commit,
+          # не переписывая секреты инстанса.
+          printf 'API_IMAGE=%s\n' "$IMAGE_REF" > .deploy-bundle/.env.image
+          chmod 600 .deploy-bundle/instances/*.env .deploy-bundle/.env.image
+
+      - name: Prepare SSH
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
 
-      - name: Deploy over SSH
+      - name: Upload deploy bundle
+        shell: bash
         run: |
-          ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes \
-            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -s <<'EOF'
           set -euo pipefail
-          cd /opt/ai-based
-          git pull --ff-only
-          docker compose -f docker-compose.prod.yml up -d --build
-          docker image prune -f >/dev/null 2>&1 || true
-          EOF
+          bundle="/tmp/ai-based-deploy-${GITHUB_RUN_ID}"
+          ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "rm -rf '$bundle' && mkdir -p '$bundle'"
+          scp -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -r .deploy-bundle/. \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:$bundle/"
 
-      - name: Smoke test (healthz)
+      - name: Login to GHCR on server
+        shell: bash
         run: |
-          for i in $(seq 1 24); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" https://appstorepro.store/healthz || true)
-            if [ "$code" = "200" ]; then echo "healthz OK"; exit 0; fi
-            echo "attempt $i: HTTP $code, retrying..."; sleep 5
-          done
-          echo "healthz did not return 200 in time"; exit 1
+          set -euo pipefail
+          printf '%s\n' "${{ secrets.GHCR_PULL_TOKEN }}" | \
+            ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+              "docker login ghcr.io -u '${{ secrets.GHCR_USER }}' --password-stdin"
+
+      - name: Deploy over SSH
+        shell: bash
+        env:
+          PUBLIC_SMOKE_FATAL: ${{ github.event_name == 'workflow_dispatch' && inputs.public_smoke_fatal || 'false' }}
+        run: |
+          set -euo pipefail
+          bundle="/tmp/ai-based-deploy-${GITHUB_RUN_ID}"
+          ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "DEPLOY_ROOT='${DEPLOY_ROOT}' BUNDLE='$bundle' PUBLIC_SMOKE_FATAL='${PUBLIC_SMOKE_FATAL}' bash -s" <<'REMOTE'
+          set -uo pipefail
+
+          FAILED=""
+
+          # Проверяем, что есть общая external network `web`, к которой подключён Traefik.
+          if ! docker network inspect web >/dev/null 2>&1; then
+            echo "::error title=Missing Docker network::external network 'web' was not found; shared Traefik must be attached to it"
+            exit 1
+          fi
+
+          mkdir -p "$DEPLOY_ROOT"
+
+          while IFS='|' read -r slug domain env_file; do
+            [ -n "$slug" ] || continue
+            dir="$DEPLOY_ROOT/$slug"
+            echo "[deploy:$slug] dir=$dir domain=$domain"
+
+            # Self-provisioning: если директории инстанса ещё нет, создаём её.
+            # Если есть, просто обновляем compose/.env/.env.image.
+            mkdir -p "$dir"
+            install -m 0644 "$BUNDLE/docker-compose.prod.yml" "$dir/docker-compose.prod.yml"
+            install -m 0600 "$BUNDLE/instances/$env_file" "$dir/.env"
+            install -m 0600 "$BUNDLE/.env.image" "$dir/.env.image"
+
+            # -p "$slug" изолирует контейнеры, network и volume каждого инстанса.
+            compose="docker compose -p $slug --env-file $dir/.env --env-file $dir/.env.image -f $dir/docker-compose.prod.yml"
+
+            echo "[deploy:$slug] pull"
+            # Скачиваем уже собранный image из GHCR.
+            if ! $compose pull; then
+              echo "::error title=pull failed ($slug)::docker compose pull failed"
+              FAILED="$FAILED $slug"
+              continue
+            fi
+
+            echo "[deploy:$slug] up"
+            # Сначала гарантируем, что Postgres поднят. Не делаем force-recreate для БД:
+            # volume должен жить между деплоями, а смена POSTGRES_PASSWORD для уже
+            # инициализированного volume отдельно требует ручной DB-операции.
+            if ! $compose up -d postgres; then
+              echo "::error title=postgres up failed ($slug)::docker compose up -d postgres failed"
+              $compose logs --tail 80 postgres 2>&1 || true
+              FAILED="$FAILED $slug"
+              continue
+            fi
+
+            # API пересоздаём явно, чтобы изменения .env, Traefik labels или API_IMAGE
+            # точно попали в новый контейнер даже если compose не заметит env_file diff.
+            if ! $compose up -d --force-recreate --no-deps api; then
+              echo "::error title=api up failed ($slug)::docker compose up -d --force-recreate --no-deps api failed"
+              $compose logs --tail 80 api postgres 2>&1 || true
+              FAILED="$FAILED $slug"
+              continue
+            fi
+
+            echo "[deploy:$slug] wait api health"
+            ready=0
+            for i in $(seq 1 45); do
+              # Источник истины для backend: Docker healthcheck api-контейнера.
+              cid="$($compose ps -q api 2>/dev/null || true)"
+              health="$(docker inspect "$cid" --format '{{.State.Health.Status}}' 2>/dev/null || echo none)"
+              if [ "$health" = "healthy" ]; then
+                ready=1
+                echo "[deploy:$slug] api healthy"
+                break
+              fi
+              echo "[deploy:$slug] api health=$health ($i/45)"
+              sleep 2
+            done
+
+            if [ "$ready" -ne 1 ]; then
+              echo "::error title=api not healthy ($slug)::api did not become healthy"
+              $compose logs --tail 100 api postgres 2>&1 || true
+              FAILED="$FAILED $slug"
+              continue
+            fi
+
+            url="https://$domain/healthz"
+            echo "[smoke:$slug] GET $url"
+            smoke_ok=0
+            for i in $(seq 1 12); do
+              # Public smoke проверяет весь внешний путь: DNS -> Traefik -> api.
+              if curl -fsS --max-time 5 "$url" >/dev/null; then
+                smoke_ok=1
+                echo "[smoke:$slug] OK"
+                break
+              fi
+              echo "[smoke:$slug] not ready ($i/12)"
+              sleep 5
+            done
+
+            if [ "$smoke_ok" -ne 1 ]; then
+              msg="$url did not return 200 within 60s"
+              if [ "$PUBLIC_SMOKE_FATAL" = "true" ]; then
+                echo "::error title=public smoke failed ($slug)::$msg"
+                FAILED="$FAILED $slug"
+              else
+                echo "::warning title=public smoke warning ($slug)::$msg; container is healthy, DNS/TLS may still be settling"
+              fi
+            fi
+          done < "$BUNDLE/instances.list"
+
+          echo "[deploy] prune old images (best effort)"
+          # Чистим неиспользуемые image/layers. Команда best-effort и не должна валить deploy.
+          docker image prune -f >/dev/null 2>&1 || true
+          rm -rf "$BUNDLE"
+
+          # Деплой считается красным, если хотя бы один инстанс реально не поднялся.
+          if [ -n "$FAILED" ]; then
+            echo "::error title=Deploy failed::instance(s) failed:$FAILED"
+            exit 1
+          fi
+
+          echo "[deploy] all instances deployed"
+          REMOTE

@@ -1,0 +1,3 @@
+creation_rules:
+  - path_regex: deploy/instances/.*\.env(\.enc)?$
+    age: age1k272remz9ls43amrtpyqxf25jhe4m20qe9skq6rhd88st7l9lfrscamnka
