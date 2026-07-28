@@ -256,6 +256,28 @@ jobs:
             # -p "$slug" изолирует контейнеры, network и volume каждого инстанса.
             compose="docker compose -p $slug --env-file $dir/.env --env-file $dir/.env.image -f $dir/docker-compose.prod.yml"
 
+            # Guard против коллизии имени проекта (инцидент 2026-07-28): если INSTANCE_SLUG
+            # совпал с compose-проектом ДРУГОГО продукта на этом сервере (напр. claude-ios
+            # `corvionet` в /opt/corvionet), `up` пересоздаст ЧУЖИЕ контейнеры своим образом и
+            # угонит их. Проверяем ДО любого up: все инстансы ai-based живут ПОД $DEPLOY_ROOT, значит
+            # любой контейнер проекта $slug, чей compose-файл лежит ВНЕ $DEPLOY_ROOT — чужой продукт.
+            # Дискриминатор по корню (а не по точному пути $dir) намеренно: слаг/каталог инстанса
+            # может смениться (corvionet -> corvionet-store), и его СОБСТВЕННЫЕ контейнеры со старым
+            # путём под $DEPLOY_ROOT ложно-положительно блокировать нельзя. Пустой label не в счёт.
+            foreign=""
+            for cid in $(docker ps -aq --filter "label=com.docker.compose.project=$slug"); do
+              cf="$(docker inspect "$cid" --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)"
+              case "$cf" in
+                "$DEPLOY_ROOT"/*|"") : ;;   # наш инстанс (под корнем ai-based) или незалейбленный
+                *) foreign="$foreign $(docker inspect "$cid" --format '{{.Name}}' 2>/dev/null | sed 's#^/##')" ;;
+              esac
+            done
+            if [ -n "$foreign" ]; then
+              echo "::error title=Project collision ($slug)::compose-проект '$slug' уже занят чужими контейнерами ($foreign) из compose-файла вне $DEPLOY_ROOT. Деплой прерван, чтобы не угнать их. Смените INSTANCE_SLUG на уникальное значение."
+              FAILED="$FAILED $slug"
+              continue
+            fi
+
             echo "[deploy:$slug] pull"
             # Скачиваем уже собранный image из GHCR.
             if ! $compose pull; then
